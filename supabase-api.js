@@ -813,12 +813,12 @@
   };
 
   // ===== ADMIN USER MGMT =====  (เปลี่ยนรหัสผ่านต้องผ่าน GAS — ดูหมายเหตุท้ายไฟล์)
+  // หน้า Login = anon (ยังไม่มี JWT) → อ่านตารางตรงไม่ได้ (RLS)
+  // ใช้ RPC get_teacher_list (SECURITY DEFINER, เปิดให้ anon) แทน
   BACKEND.getTeacherListForLogin = function () {
-    return Promise.all([pick(sb.from('user_profiles').select('username,prefix,firstname,lastname')), pick(sb.from('users').select('username,role'))]).then(function (a) {
-      var nameMap = {}; a[0].forEach(function (u) { nameMap[u.username] = ((u.prefix || '') + (u.firstname || '') + ' ' + (u.lastname || '')).trim(); });
-      var out = [];
-      a[1].forEach(function (u) { var role = String(u.role || '').toLowerCase(); if (role === 'admin' || role === 'teacher') { var n = nameMap[u.username]; out.push({ username: u.username, name: (n && n !== '') ? n : u.username }); } });
-      return out;
+    return sb.rpc('get_teacher_list').then(function (r) {
+      if (r.error) throw r.error;
+      return (r.data || []).map(function (x) { return { username: x.username, name: x.name }; });
     });
   };
   BACKEND.getAdminAllUsers = function () {
