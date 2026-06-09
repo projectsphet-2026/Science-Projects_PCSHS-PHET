@@ -44,13 +44,34 @@
   // -------------------------------------------------------------------------
   var BACKEND = {};
 
-  // ===== AUTH + UPLOAD (ผ่าน GAS Web App) =====
+  // ===== AUTH =====
+  // login รหัสผ่าน → Supabase RPC public.login (เซ็น JWT ใน Postgres) — ไม่พึ่ง GAS
   BACKEND.loginWithPassword = function (username, password) {
-    return gasCall('loginWithPassword', { username: username, password: password }).then(_afterLogin);
+    return sb.rpc('login', { p_username: String(username).trim(), p_password: String(password).trim() }).then(function (r) {
+      if (r.error) throw r.error;
+      var res = r.data;
+      if (!res || !res.success) return { success: false, message: (res && res.message) || 'รหัสไม่ถูกต้อง' };
+      return _applyToken(res.token).then(function () {
+        var u = res.user;
+        if (u.role === 'admin') {
+          return { success: true, user: u, adminData: res.adminData, supabaseToken: res.token };
+        }
+        return BACKEND.getUserDetails(u.username).then(function (details) {
+          return {
+            success: true,
+            user: Object.assign({}, u, details, { scores: { quizzes: [], midterm: {}, final: {} }, works: [] }),
+            supabaseToken: res.token
+          };
+        });
+      });
+    });
   };
+  // face login ยังผ่าน GAS (ผ่าน Cloudflare Worker) — ทำเป็น RPC ทีหลัง
   BACKEND.loginWithFace = function (descriptor) {
     return gasCall('loginWithFace', { descriptor: descriptor }).then(_afterLogin);
   };
+
+  // ===== UPLOAD (ผ่าน GAS Web App / Cloudflare Worker) =====
   BACKEND.registerFaceData = function (userId, descriptor) {
     return gasCall('registerFaceData', { userId: userId, descriptor: descriptor });
   };
@@ -82,13 +103,14 @@
     return sb.auth.setSession({ access_token: token, refresh_token: token });
   }
 
-  // ต่ออายุ JWT ผ่าน GAS (ต้องเรียกตอน token ยัง valid) — token ใหม่อายุอีก 8 ชม.
+  // ต่ออายุ JWT ผ่าน Supabase RPC refresh_session (ต้องเรียกตอน session ยัง valid)
   function refreshSession() {
     if (!currentToken) return Promise.resolve();
-    return gasCall('refreshToken', { callerToken: currentToken }).then(function (r) {
-      if (r && r.success && r.supabaseToken) return _applyToken(r.supabaseToken);
-      // token หมดอายุ/ผิด → ปล่อยให้ flow login จัดการ (RLS จะปฏิเสธ query)
-      console.warn('[supabase-api] ต่ออายุ token ไม่สำเร็จ:', r && r.message);
+    return sb.rpc('refresh_session').then(function (r) {
+      if (r.error) { console.warn('[supabase-api] refresh error', r.error); return; }
+      var res = r.data;
+      if (res && res.success && res.token) return _applyToken(res.token);
+      console.warn('[supabase-api] ต่ออายุ token ไม่สำเร็จ:', res && res.message);
     }).catch(function (e) { console.warn('[supabase-api] refresh error', e); });
   }
   window.refreshSupabaseSession = refreshSession; // เผื่อเรียกเอง/debug
@@ -134,7 +156,7 @@
       prefix: data.prefix, firstname: data.firstname, lastname: data.lastname, nickname: data.nickname,
       birthday: data.birthday, telephone: data.telephone, line: data.line, facebook: data.facebook, ig: data.ig
     }).select()).then(function () {
-      if (data.newPassword) return gasCall('__setpw__', { callerToken: currentToken, username: username, password: data.newPassword });
+      if (data.newPassword) return sb.rpc('change_password', { p_username: username, p_password: String(data.newPassword) }).then(function (r) { if (r.error) throw r.error; });
     }).then(function () { return { success: true, message: 'บันทึกข้อมูลเรียบร้อยแล้ว' }; });
   };
 
@@ -836,7 +858,7 @@
       var isNew = !ex;
       return pick(sb.from('users').upsert({ username: username, role: data.role }).select())
         .then(function () { return pick(sb.from('user_profiles').upsert({ username: username, picture_url: data.image || '', classroom: data.classroom || '', number: data.number || '', prefix: data.prefix || '', firstname: data.firstname || '', lastname: data.lastname || '' }).select()); })
-        .then(function () { if (data.password || isNew) return gasCall('__setpw__', { callerToken: currentToken, username: username, password: data.password || username }); })
+        .then(function () { if (data.password || isNew) return sb.rpc('change_password', { p_username: username, p_password: data.password || username }).then(function (r) { if (r.error) throw r.error; }); })
         .then(function () { return { success: true, message: 'บันทึกข้อมูลเรียบร้อย' }; });
     });
   };
@@ -870,7 +892,12 @@
       if (!authRows.length) return { success: true, imported: 0, skipped: skipped, message: 'นำเข้าสำเร็จ 0 รายการ (ข้าม ' + skipped + ' รายการที่ซ้ำ)' };
       return pick(sb.from('users').insert(authRows).select())
         .then(function () { return pick(sb.from('user_profiles').insert(detailRows).select()); })
-        .then(function () { return gasCall('__setpw_bulk__', { callerToken: currentToken, passwords: pwds }); })
+        .then(function () {
+          // ตั้งรหัสผ่านทีละคนผ่าน RPC (change_password เช็คสิทธิ์ admin จาก session)
+          return pwds.reduce(function (chain, p) {
+            return chain.then(function () { return sb.rpc('change_password', { p_username: p.username, p_password: p.password }); });
+          }, Promise.resolve());
+        })
         .then(function () { return { success: true, imported: authRows.length, skipped: skipped, message: 'นำเข้าสำเร็จ ' + authRows.length + ' รายการ (ข้าม ' + skipped + ' รายการที่ซ้ำ)' }; });
     });
   };
@@ -918,9 +945,9 @@
 })();
 
 /**
- * หมายเหตุ "เปลี่ยนรหัสผ่าน" (updateUserProfile.newPassword, saveAdminUser, batchImportUsers):
- * รหัสผ่าน hash อยู่ใน Postgres และ set ผ่าน RPC ที่เปิดสิทธิ์เฉพาะ service_role
- * → frontend (anon) เรียกตรงไม่ได้ ต้องผ่าน GAS Web App
- * ในไฟล์นี้เรียก gasCall('__setpw__'/'__setpw_bulk__') ไว้เป็น placeholder —
- * ให้เพิ่ม action เหล่านี้ใน webapp.gs (เรียก set_user_password) เมื่อต้องใช้ฟีเจอร์นี้
+ * หมายเหตุ auth (เฟส 6):
+ *  - login / ต่ออายุ token / เปลี่ยนรหัสผ่าน → Supabase RPC (login, refresh_session, change_password)
+ *    เซ็น JWT ใน Postgres ด้วย pgcrypto — ไม่พึ่ง GAS, ไม่มี CORS
+ *  - upload 4 ตัว + loginWithFace → ยังผ่าน GAS แต่ gasCall ชี้ไป Cloudflare Worker (GAS_WEBAPP_URL)
+ *    ต้องรัน phase6_login_rpc.sql + ใส่ jwt_secret ใน private.app_secrets ก่อนใช้งาน
  */
