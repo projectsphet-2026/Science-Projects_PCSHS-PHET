@@ -14,8 +14,17 @@
   'use strict';
 
   var CFG = window.APP_CONFIG || {};
+
+  // token ปัจจุบัน (JWT ที่ public.login เซ็นให้) — แนบกับทุก request ผ่าน option accessToken
+  var currentToken = null;
+  var _refreshTimer = null;
+  var _lastRefresh = 0;
+  var TOKEN_KEY = 'phet_token';
+
+  // ใช้ accessToken (custom JWT) → supabase-js แนบ Authorization ให้ทุก request
+  // และ "ไม่ยุ่งกับ GoTrue (/auth/v1/user)" จึงไม่มี error 400
   var sb = window.supabase.createClient(CFG.SUPABASE_URL, CFG.SUPABASE_ANON_KEY, {
-    auth: { persistSession: true, autoRefreshToken: false }
+    accessToken: function () { return currentToken; }   // null ก่อน login = ใช้ anon
   });
   window.sb = sb; // เผื่อ debug
 
@@ -84,11 +93,7 @@
   };
   BACKEND.uploadPostImage = function (fileData) { return gasCall('uploadPostImage', { fileData: fileData }); };
 
-  var currentToken = null; // JWT ปัจจุบัน (ใช้แนบตอนเรียก action ที่ต้องพิสูจน์ตัวตน)
-  var _refreshTimer = null;
-  var _lastRefresh = 0;
-
-  // ตั้ง Supabase session ด้วย JWT ที่ GAS เซ็นให้ → RLS ทำงาน
+  // ตั้ง token ปัจจุบัน (face login ผ่าน GAS ก็ใช้ตัวนี้)
   function _afterLogin(res) {
     if (res && res.success && res.supabaseToken) {
       return _applyToken(res.supabaseToken).then(function () { return res; });
@@ -96,11 +101,13 @@
     return res;
   }
 
+  // เก็บ token → currentToken (accessToken จะแนบให้ทุก request) + localStorage + ตั้ง timer ต่ออายุ
   function _applyToken(token) {
     currentToken = token;
     _lastRefresh = Date.now();
+    try { localStorage.setItem(TOKEN_KEY, token); } catch (e) {}
     _startRefreshTimer();
-    return sb.auth.setSession({ access_token: token, refresh_token: token });
+    return Promise.resolve();
   }
 
   // ต่ออายุ JWT ผ่าน Supabase RPC refresh_session (ต้องเรียกตอน session ยัง valid)
@@ -125,14 +132,26 @@
     if (currentToken && Date.now() - _lastRefresh > 30 * 60 * 1000) refreshSession();
   });
 
-  // ตอนโหลดหน้า: ถ้ามี session ค้างอยู่ (persistSession) ให้ดึง token มาต่ออายุต่อ
-  sb.auth.getSession().then(function (r) {
-    if (r && r.data && r.data.session && r.data.session.access_token) {
-      currentToken = r.data.session.access_token;
-      _lastRefresh = Date.now();
-      _startRefreshTimer();
-    }
-  });
+  // logout: ล้าง token
+  window.phetLogout = function () {
+    currentToken = null;
+    try { localStorage.removeItem(TOKEN_KEY); } catch (e) {}
+    if (_refreshTimer) clearInterval(_refreshTimer);
+  };
+
+  // ตอนโหลดหน้า: กู้ token จาก localStorage ถ้ายังไม่หมดอายุ (คง login ข้ามการรีเฟรชหน้า)
+  (function () {
+    try {
+      var saved = localStorage.getItem(TOKEN_KEY);
+      if (!saved) return;
+      var payload = JSON.parse(decodeURIComponent(escape(atob(saved.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')))));
+      if (payload && payload.exp && payload.exp * 1000 > Date.now()) {
+        currentToken = saved; _lastRefresh = Date.now(); _startRefreshTimer();
+      } else {
+        localStorage.removeItem(TOKEN_KEY);
+      }
+    } catch (e) { try { localStorage.removeItem(TOKEN_KEY); } catch (e2) {} }
+  })();
 
   // ===== USER =====
   BACKEND.getUserDetails = function (username) {
